@@ -25,9 +25,11 @@ import com.linkedin.metadata.ratelimit.RateLimitEngine;
 import com.linkedin.metadata.ratelimit.RateLimitHeaderWriter;
 import com.linkedin.metadata.ratelimit.model.RateLimitDecision;
 import com.linkedin.metadata.ratelimit.model.RateLimitLease;
+import com.linkedin.metadata.usage.instrumentation.UsageMetricsSessionEnricher;
 import com.linkedin.metadata.utils.metrics.MetricUtils;
 import graphql.ExecutionResult;
 import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.graphql.GraphqlUsageClassificationRegistry;
 import io.opentelemetry.api.trace.Span;
 import jakarta.inject.Inject;
 import jakarta.servlet.http.HttpServletRequest;
@@ -41,6 +43,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.Nonnull;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -65,6 +68,11 @@ public class GraphQLController {
   @Inject MetricUtils metricUtils;
 
   @Inject RateLimitEngine rateLimitEngine;
+
+  @Inject GraphqlUsageClassificationRegistry graphqlUsageClassificationRegistry;
+
+  @Autowired(required = false)
+  UsageMetricsSessionEnricher usageMetricsSessionEnricher;
 
   @Nonnull
   @Inject
@@ -128,8 +136,10 @@ public class GraphQLController {
             ? operationNameJson.asText()
             : null;
     final GraphqlDocumentMetadata documentMetadata =
-        GraphqlDocumentAnalyzer.analyze(operationName, query, null);
-    final String resolvedOperationName = documentMetadata.resolvedOperationName();
+        GraphqlDocumentAnalyzer.analyze(
+            operationName,
+            query,
+            name -> graphqlUsageClassificationRegistry.resolveByOperationName(name).isPresent());
 
     /*
      * Extract "variables" map
@@ -142,26 +152,9 @@ public class GraphQLController {
 
     Authentication authentication = AuthenticationContext.getAuthentication();
 
-    SpringQueryContext context =
-        new SpringQueryContext(
-            true,
-            authentication,
-            _authorizerChain,
-            systemOperationContext,
-            configurationProvider,
-            request,
-            resolvedOperationName,
-            query,
-            variables);
-    Span.current().setAttribute(ACTOR_URN_ATTR, context.getActorUrn());
-
-    final String threadName = Thread.currentThread().getName();
-    final String queryName = context.getQueryName();
-    log.debug("Query: {}, variables: {}", query, variables);
-
     RateLimitDecision rateLimitDecision =
         rateLimitEngine.evaluateAndAcquireGraphQL(
-            request.getRequestURI(), request.getMethod(), resolvedOperationName);
+            request.getRequestURI(), request.getMethod(), documentMetadata.resolvedOperationName());
     if (!rateLimitDecision.isAllowed()) {
       try {
         HttpHeaders headers = new HttpHeaders();
@@ -176,10 +169,34 @@ public class GraphQLController {
             new ResponseEntity<>(HttpStatus.TOO_MANY_REQUESTS));
       }
     }
+
+    SpringQueryContext context =
+        new SpringQueryContext(
+            true,
+            authentication,
+            _authorizerChain,
+            systemOperationContext,
+            configurationProvider,
+            request,
+            documentMetadata,
+            variables,
+            graphqlUsageClassificationRegistry);
+    Span.current()
+        .setAttribute(
+            ACTOR_URN_ATTR,
+            authentication.getActor() != null
+                ? authentication.getActor().toUrnStr()
+                : context.getActorUrn());
+
+    final String threadName = Thread.currentThread().getName();
+    final String queryName = context.getQueryName();
+    log.debug("Query: {}, variables: {}", query, variables);
+
     final RateLimitLease rateLimitLease = rateLimitEngine.toLease(rateLimitDecision);
     final HttpHeaders rateLimitHeaders = new HttpHeaders();
     RateLimitHeaderWriter.createHeaders(rateLimitDecision).forEach(rateLimitHeaders::add);
     final AtomicBoolean executionSucceeded = new AtomicBoolean(false);
+    final OperationContext usageSessionContext = context.getOperationContext();
     boolean asyncStarted = false;
     try {
       CompletableFuture<ResponseEntity<String>> executionFuture =
@@ -233,6 +250,10 @@ public class GraphQLController {
                         responseBodyStr.length());
                   }
                   log.trace("Execution result: {}", responseBodyStr);
+                  if (usageMetricsSessionEnricher != null) {
+                    usageMetricsSessionEnricher.recordResponseWithBytes(
+                        usageSessionContext, (long) responseBodyStr.length());
+                  }
                   return new ResponseEntity<>(responseBodyStr, rateLimitHeaders, HttpStatus.OK);
                 } catch (IllegalArgumentException | JsonProcessingException e) {
                   log.error(
