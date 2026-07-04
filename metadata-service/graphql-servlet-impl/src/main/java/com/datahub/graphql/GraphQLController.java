@@ -19,7 +19,8 @@ import com.linkedin.datahub.graphql.GraphQLEngine;
 import com.linkedin.datahub.graphql.concurrency.GraphQLConcurrencyUtils;
 import com.linkedin.datahub.graphql.exception.DataHubGraphQLError;
 import com.linkedin.gms.factory.config.ConfigurationProvider;
-import com.linkedin.metadata.ratelimit.GraphQLOperationNameResolver;
+import com.linkedin.metadata.ratelimit.GraphqlDocumentAnalyzer;
+import com.linkedin.metadata.ratelimit.GraphqlDocumentMetadata;
 import com.linkedin.metadata.ratelimit.RateLimitEngine;
 import com.linkedin.metadata.ratelimit.RateLimitHeaderWriter;
 import com.linkedin.metadata.ratelimit.model.RateLimitDecision;
@@ -126,7 +127,9 @@ public class GraphQLController {
         (operationNameJson != null && !operationNameJson.isNull())
             ? operationNameJson.asText()
             : null;
-    final String resolvedOperationName = GraphQLOperationNameResolver.resolve(operationName, query);
+    final GraphqlDocumentMetadata documentMetadata =
+        GraphqlDocumentAnalyzer.analyze(operationName, query, null);
+    final String resolvedOperationName = documentMetadata.resolvedOperationName();
 
     /*
      * Extract "variables" map
