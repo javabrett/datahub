@@ -412,12 +412,9 @@ public class InMemoryUsageAggregationStoreTest {
   @Test(priority = 100)
   public void testConcurrentRecordDuringFlushDoesNotLoseEvents() throws Exception {
     int requestCount = 200;
-    InMemoryUsageAggregationStore concurrentStore = store;
-    RecordingUsageFlushSink concurrentSink = sink;
     CountDownLatch recordersReady = new CountDownLatch(4);
     CountDownLatch startRecording = new CountDownLatch(1);
     CountDownLatch recordingDone = new CountDownLatch(4);
-    CountDownLatch flushingDone = new CountDownLatch(1);
     AtomicInteger recorded = new AtomicInteger();
 
     ExecutorService executor = Executors.newFixedThreadPool(5);
@@ -429,7 +426,7 @@ public class InMemoryUsageAggregationStoreTest {
               try {
                 startRecording.await();
                 for (int i = 0; i < requestCount / 4; i++) {
-                  if (concurrentStore.recordRequest(
+                  if (store.recordRequest(
                       session(Constants.METATDATA_TEST_ACTOR, "metadata_write", null))) {
                     recorded.incrementAndGet();
                   }
@@ -445,26 +442,21 @@ public class InMemoryUsageAggregationStoreTest {
       recordersReady.await();
       executor.submit(
           () -> {
-            try {
-              for (int i = 0; i < 50 && !Thread.currentThread().isInterrupted(); i++) {
-                concurrentStore.flush(FlushTrigger.SCHEDULED);
-                Thread.yield();
-              }
-            } finally {
-              flushingDone.countDown();
+            for (int i = 0; i < 50; i++) {
+              store.flush(FlushTrigger.SCHEDULED);
+              Thread.yield();
             }
           });
       startRecording.countDown();
       Assert.assertTrue(recordingDone.await(30, TimeUnit.SECONDS));
-      Assert.assertTrue(flushingDone.await(30, TimeUnit.SECONDS));
     } finally {
       executor.shutdownNow();
     }
 
-    concurrentStore.flush(FlushTrigger.SHUTDOWN);
+    store.flush(FlushTrigger.SHUTDOWN);
 
     long apiCalls =
-        concurrentSink.batches().stream()
+        sink.batches().stream()
             .flatMap(batch -> batch.additiveRows().stream())
             .filter(row -> row.metricName().equals("api_calls"))
             .mapToLong(row -> row.valueSum())

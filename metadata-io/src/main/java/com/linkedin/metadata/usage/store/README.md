@@ -15,7 +15,7 @@ flush sinks registered via Spring extension points.
 
 Types were named `*UsageRollupStore` initially but were **renamed to `*UsageAggregationStore`** to
 avoid colliding with the legacy product-usage rollup package under
-[`com.linkedin.metadata.billing.rollup`](../billing/rollup/README.md).
+`com.linkedin.metadata.billing.rollup` (SaaS).
 
 ## Entry points
 
@@ -36,5 +36,4 @@ avoid colliding with the legacy product-usage rollup package under
 ## Not this package
 
 **Product usage events** from integrations (MCP, LLM tokens, etc.) use
-[`com.linkedin.metadata.billing.rollup`](../billing/rollup/README.md) (`UsageRollupStore`,
-`InMemoryUsageRollupStore`).
+`com.linkedin.metadata.billing.rollup` (`UsageRollupStore`, `InMemoryUsageRollupStore`) on SaaS.

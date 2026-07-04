@@ -26,7 +26,7 @@ Configuration YAML loaders and manifests live in `com.linkedin.metadata.config.u
 
 ## Not this tree
 
-**Product usage events** from integrations (MCP, LLM tokens, etc.) use
-[`com.linkedin.metadata.billing.rollup`](../billing/rollup/README.md).
+**Product usage events** from integrations (MCP, LLM tokens, etc.) use the separate
+`com.linkedin.metadata.billing.rollup` package (SaaS), not this tree.
 
 See [`store/README.md`](store/README.md) for store-level types.

@@ -1,59 +1,135 @@
 """
-Smoke test for DataHub-specific metrics.
+Smoke tests for GMS usage-aggregation Micrometer export.
 
-This test verifies that:
-1. DataHub custom metrics are being generated
-2. The new incrementMicrometer metrics are working
-3. Request context metrics are being recorded
+Verifies flush-based operational metrics (not per-request counters) when
+USAGE_AGGREGATION_ENABLED is on — as in Docker quickstart dev profile.
 """
 
 import logging
 
 import pytest
-import requests
 
+from tests.metrics.usage_aggregation_metrics import (
+    ACTIVE_IDENTITIES_METRIC,
+    AGGREGATION_TAG_KEYS,
+    INPUT_BYTES_METRIC,
+    OUTPUT_BYTES_METRIC,
+    REQUEST_COUNT_METRIC,
+    assert_samples_have_tag_keys,
+    assert_samples_lack_tag,
+    can_provision_native_users,
+    expected_actor_class_for_admin_session,
+    fetch_metric_total,
+    find_metric_samples,
+    generate_graphql_read_traffic,
+    graphql_metadata_query_tags,
+    parse_prometheus_tags,
+    wait_for_metric_delta,
+)
+from tests.utilities.metadata_operations import get_prometheus_metrics
+from tests.utilities.multi_user import cleanup_step_actor_user, make_step_actor_user
 from tests.utils import get_gms_prometheus_base_url
 
 logger = logging.getLogger(__name__)
 
 
+def _require_prometheus_url() -> str:
+    gms_url = get_gms_prometheus_base_url()
+    if gms_url is None:
+        pytest.skip(
+            "Management endpoint not resolvable in this environment — "
+            "Prometheus port (4319) is cluster-internal only."
+        )
+    return gms_url
+
+
 @pytest.mark.read_only
-def test_datahub_request_count_metric_present():
-    """Test that the new datahub_request_count metric is present in Prometheus output."""
-    prometheus_url = f"{get_gms_prometheus_base_url()}/actuator/prometheus"
-
-    # Service initialization should already induce requests that will generate
-    # metrics. So we don't need to trigger any requests as part of test setup.
-    response = requests.get(prometheus_url)
-    content = response.text
-
-    # Look specifically for the datahub_request_count metric
-    metric_lines = []
-    for line in content.split("\n"):
-        line = line.strip()
-        if line and not line.startswith("#"):
-            if "datahub_request_count" in line:
-                metric_lines.append(line)
-
-    logger.info(f"✅ Found {len(metric_lines)} datahub_request_count metric lines")
-    for line in metric_lines:
-        logger.info(f"  - {line}")
-
-    # The metric should be present
-    assert len(metric_lines) > 0, (
-        "datahub_request_count metric not found in Prometheus output"
+def test_usage_aggregation_micrometer_export(auth_session):
+    """Aggregation flush exports request, byte, and identity counters to Prometheus."""
+    gms_url = _require_prometheus_url()
+    graphql_tags = graphql_metadata_query_tags(
+        expected_actor_class_for_admin_session(auth_session)
     )
 
-    # Verify that the metric has the expected tags
-    expected_tags = ["user_category", "agent_class", "request_api"]
-    logger.info(f"🔍 Checking for expected tags: {expected_tags}")
+    request_baseline = fetch_metric_total(
+        auth_session, gms_url, REQUEST_COUNT_METRIC, graphql_tags
+    )
+    input_baseline = fetch_metric_total(auth_session, gms_url, INPUT_BYTES_METRIC)
+    output_baseline = fetch_metric_total(auth_session, gms_url, OUTPUT_BYTES_METRIC)
 
-    for metric_line in metric_lines:
-        # Check if the metric line contains the expected tags
-        has_expected_tags = all(tag in metric_line for tag in expected_tags)
-        assert has_expected_tags, (
-            f"Metric line missing expected tags. Line: {metric_line}, Expected tags: {expected_tags}"
+    generate_graphql_read_traffic(auth_session)
+
+    wait_for_metric_delta(
+        auth_session,
+        gms_url,
+        REQUEST_COUNT_METRIC,
+        request_baseline,
+        required_tags=graphql_tags,
+        min_delta=1.0,
+    )
+    wait_for_metric_delta(
+        auth_session,
+        gms_url,
+        INPUT_BYTES_METRIC,
+        input_baseline,
+        min_delta=1.0,
+    )
+    # output_bytes includes GraphQL (recordResponseWithBytes on async completion) and
+    # OpenAPI/Rest.li (UsageRecordingFilter). See test_usage_aggregation_graphql_output_bytes.
+    wait_for_metric_delta(
+        auth_session,
+        gms_url,
+        OUTPUT_BYTES_METRIC,
+        output_baseline,
+        min_delta=1.0,
+    )
+
+    if can_provision_native_users(auth_session):
+        user_urn, regular_session = make_step_actor_user(auth_session, "metrics-smoke")
+        try:
+            regular_tags = graphql_metadata_query_tags("regular")
+            identity_baseline = fetch_metric_total(
+                auth_session,
+                gms_url,
+                ACTIVE_IDENTITIES_METRIC,
+                {"identity_metric": "active_users", **regular_tags},
+            )
+            generate_graphql_read_traffic(regular_session, repeat=2)
+            wait_for_metric_delta(
+                auth_session,
+                gms_url,
+                ACTIVE_IDENTITIES_METRIC,
+                identity_baseline,
+                required_tags={"identity_metric": "active_users", **regular_tags},
+            )
+        finally:
+            regular_session.destroy()
+            cleanup_step_actor_user(auth_session, user_urn)
+    else:
+        logger.info(
+            "Skipping active_identities delta — admin session lacks manageIdentities "
+            "(datahub superuser cannot provision native users in quickstart)"
         )
-        logger.info(f"✅ Metric line has all expected tags: {metric_line}")
 
-    logger.info("🎉 All datahub_request_count metrics have the expected tags!")
+    content = get_prometheus_metrics(auth_session, gms_url)
+
+    request_samples = find_metric_samples(
+        content,
+        REQUEST_COUNT_METRIC,
+        required_tags=graphql_tags,
+    )
+    assert_samples_have_tag_keys(request_samples, AGGREGATION_TAG_KEYS)
+    assert_samples_lack_tag(request_samples, "user_category")
+
+    input_samples = find_metric_samples(content, INPUT_BYTES_METRIC)
+    output_samples = find_metric_samples(content, OUTPUT_BYTES_METRIC)
+    assert_samples_have_tag_keys(input_samples, AGGREGATION_TAG_KEYS)
+    assert_samples_have_tag_keys(output_samples, AGGREGATION_TAG_KEYS)
+
+    identity_samples = find_metric_samples(content, ACTIVE_IDENTITIES_METRIC)
+    for sample in identity_samples:
+        assert "identity_metric" in parse_prometheus_tags(sample), (
+            f"active_identities sample missing identity_metric label: {sample}"
+        )
+
+    logger.info("Usage aggregation Micrometer counters increased after GraphQL read")
