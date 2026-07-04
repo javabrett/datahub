@@ -6,6 +6,7 @@ import static org.testng.Assert.*;
 import com.google.common.net.HttpHeaders;
 import com.linkedin.metadata.Constants;
 import com.linkedin.metadata.utils.metrics.MetricUtils;
+import io.datahubproject.metadata.context.usage.AuthChannel;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.TraceFlags;
@@ -369,5 +370,37 @@ public class RequestContextTraceTest {
 
     // Trace ID should still be extracted
     assertEquals(context.getTraceId(), "validtraceid1234validtraceid1234");
+  }
+
+  @Test
+  public void testUsageFieldsPopulateMdcWhenTagged() {
+    mockSpan.when(Span::current).thenReturn(null);
+
+    RequestContext.builder()
+        .buildOpenapi(Constants.DATAHUB_ACTOR, mockHttpRequest, "postEntities", "dataset")
+        .usageOperation("metadata_ingest")
+        .usageIdentity("urn:li:corpuser:datahub")
+        .authChannel(AuthChannel.PAT)
+        .inputBytes(256L)
+        .usageQuantity(2)
+        .metricUtils(mockMetricUtils)
+        .build();
+
+    mockMDC.verify(() -> MDC.put(RequestContext.MDC_USAGE_OPERATION, "metadata_ingest"));
+    mockMDC.verify(
+        () -> MDC.put(RequestContext.MDC_AUTH_CHANNEL, AuthChannel.PAT.dimensionValue()));
+    mockMDC.verify(() -> MDC.put(RequestContext.MDC_USAGE_QUANTITY, "2"));
+    mockMDC.verify(() -> MDC.remove(RequestContext.MDC_USAGE_OPERATION), never());
+  }
+
+  @Test
+  public void testClearUsageFieldsFromMdc() {
+    mockMDC.when(() -> MDC.remove(anyString())).then(invocation -> null);
+
+    RequestContext.clearUsageFieldsFromMdc();
+
+    mockMDC.verify(() -> MDC.remove(RequestContext.MDC_USAGE_OPERATION));
+    mockMDC.verify(() -> MDC.remove(RequestContext.MDC_AUTH_CHANNEL));
+    mockMDC.verify(() -> MDC.remove(RequestContext.MDC_USAGE_QUANTITY));
   }
 }
